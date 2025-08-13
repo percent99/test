@@ -1,0 +1,491 @@
+/* =======================================================================
+   미션/포인트 관리 v7 스키마 - 완판본 DDL
+   - PostgreSQL UUID v7 기반 PK
+   - ENUM 대체: 코드 마스터/디테일 (core.code_masters / core.code_details)
+   - 스키마 분리: core / usr / mis / pt / util
+   - 공통 메타컬럼: created_by, created_at, updated_by, updated_at
+   - updated_at 자동 갱신 트리거
+   - 교차 스키마 FK 명시
+   - 보상 교환 트랜잭션 함수 포함 (pt.redeem_reward_immediate)
+   ======================================================================= */
+
+-- (권장) 트랜잭션으로 감싸기
+BEGIN;
+
+-- =========================================================================
+-- 0) (옵션) 깨끗한 재생성을 위해 드롭
+--     운영환경에서는 데이터 보존을 위해 DROP 사용 시 주의하세요.
+-- =========================================================================
+DROP VIEW IF EXISTS util.v_child_points_balance CASCADE;
+
+DROP SCHEMA IF EXISTS util CASCADE;
+DROP SCHEMA IF EXISTS pt   CASCADE;
+DROP SCHEMA IF EXISTS mis  CASCADE;
+DROP SCHEMA IF EXISTS usr  CASCADE;
+DROP SCHEMA IF EXISTS core CASCADE;
+
+-- =========================================================================
+-- 1) 스키마 생성
+-- =========================================================================
+CREATE SCHEMA core;
+CREATE SCHEMA usr;
+CREATE SCHEMA mis;
+CREATE SCHEMA pt;
+CREATE SCHEMA util;
+
+-- =========================================================================
+-- 2) UUID v7 별칭 함수 및 공용 트리거
+--    - PG 18+: uuidv7() 내장 사용
+--    - PG 17-: pg_uuidv7 확장 설치 후 uuid_generate_v7() 사용
+--    아래 두 중 한가지만 선택하여 UNCOMMENT 하세요.
+-- =========================================================================
+
+-- -- [A] PostgreSQL 18 이상
+-- CREATE OR REPLACE FUNCTION core.UUID_V7() RETURNS uuid
+-- LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+--   SELECT uuidv7()
+-- $$;
+
+-- -- [B] PostgreSQL 17 이하 (확장 설치 필요: pg_uuidv7)
+-- CREATE EXTENSION IF NOT EXISTS pg_uuidv7;
+-- CREATE OR REPLACE FUNCTION core.UUID_V7() RETURNS uuid
+-- LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+--   SELECT uuid_generate_v7()
+-- $$;
+
+COMMENT ON FUNCTION core.UUID_V7 IS 'UUID v7 생성 별칭 함수: PG18=uuidv7(), PG17=uuid_generate_v7()';
+
+-- updated_at 자동 갱신 트리거 (updated_by는 앱에서 세팅)
+CREATE OR REPLACE FUNCTION core.trg_set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END $$;
+COMMENT ON FUNCTION core.trg_set_updated_at IS '행 UPDATE 시 updated_at을 now()로 자동 갱신';
+
+-- =========================================================================
+-- 3) 코드 마스터/디테일 (ENUM 대체)
+--    - master_code + code의 자연키로 도메인 무결성 확보
+--    - 운영 중 항목追加/비활성/정렬 변경 용이
+-- =========================================================================
+
+CREATE TABLE core.code_masters (
+  code         TEXT PRIMARY KEY,                         -- 예: 'user_role', 'mission_status'
+  name         TEXT NOT NULL,                            -- 화면/리포트용
+  description  TEXT,                                     -- 설명
+  created_by   UUID,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by   UUID,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE core.code_masters IS '코드 마스터(ENUM 대체)';
+
+CREATE TRIGGER code_masters_set_updated_at
+BEFORE UPDATE ON core.code_masters
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE core.code_details (
+  master_code  TEXT NOT NULL REFERENCES core.code_masters(code) ON DELETE RESTRICT,
+  code         TEXT NOT NULL,                            -- 항목 코드 (자연키)
+  name         TEXT NOT NULL,                            -- 표시명
+  description  TEXT,                                     -- 항목 설명
+  sort_order   INT  NOT NULL DEFAULT 0,                  -- 정렬 우선순위
+  active       BOOLEAN NOT NULL DEFAULT TRUE,            -- 사용여부
+  id           UUID PRIMARY KEY DEFAULT core.UUID_V7(),  -- 서로게이트 키(선택적 활용)
+  created_by   UUID,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by   UUID,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (master_code, code)
+);
+COMMENT ON TABLE core.code_details IS '코드 디테일(ENUM 항목 대체). (master_code, code) 유니크';
+
+CREATE INDEX idx_code_details_master_active ON core.code_details(master_code, active, sort_order);
+
+CREATE TRIGGER code_details_set_updated_at
+BEFORE UPDATE ON core.code_details
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+-- 초기 코드 시드 (필요 시 수정/확장)
+INSERT INTO core.code_masters (code, name, description) VALUES
+  ('user_role','사용자 역할','parent/child'),
+  ('mission_status','미션 상태','할당→제출→승인/거절/만료/취소'),
+  ('redemption_status','교환 상태','요청→승인→지급완료/취소'),
+  ('ledger_source','원장 출처','mission/manual/bonus/penalty/redemption/adjustment'),
+  ('proof_kind','증빙 종류','photo/note');
+
+INSERT INTO core.code_details (master_code, code, name, sort_order) VALUES
+  ('user_role','parent','부모',10),
+  ('user_role','child','자녀',20),
+
+  ('mission_status','assigned','할당',10),
+  ('mission_status','submitted','제출',20),
+  ('mission_status','approved','승인',30),
+  ('mission_status','rejected','거절',40),
+  ('mission_status','expired','만료',50),
+  ('mission_status','cancelled','취소',60),
+
+  ('redemption_status','requested','요청',10),
+  ('redemption_status','approved','승인',20),
+  ('redemption_status','fulfilled','지급완료',30),
+  ('redemption_status','cancelled','취소',40),
+
+  ('ledger_source','mission','미션',10),
+  ('ledger_source','manual','수동조정',20),
+  ('ledger_source','bonus','보너스',30),
+  ('ledger_source','penalty','패널티',40),
+  ('ledger_source','redemption','교환차감',50),
+  ('ledger_source','adjustment','정산',60),
+
+  ('proof_kind','photo','사진',10),
+  ('proof_kind','note','메모',20);
+
+-- =========================================================================
+-- 4) 사용자 영역 (usr)
+-- =========================================================================
+
+CREATE TABLE usr.households (
+  id          UUID PRIMARY KEY DEFAULT core.UUID_V7(),  -- 하우스홀드 PK
+  name        TEXT NOT NULL,                            -- 가족명
+  created_by  UUID,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by  UUID,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE usr.households IS '가족(하우스홀드) 단위';
+
+CREATE TRIGGER households_uat
+BEFORE UPDATE ON usr.households
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE usr.users (
+  id                UUID PRIMARY KEY DEFAULT core.UUID_V7(),  -- 사용자 PK
+  household_id      UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  role_master_code  TEXT GENERATED ALWAYS AS ('user_role') STORED, -- 고정 마스터
+  role_code         TEXT NOT NULL,                                  -- parent/child
+  CONSTRAINT fk_users_role
+    FOREIGN KEY (role_master_code, role_code)
+    REFERENCES core.code_details(master_code, code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  display_name      TEXT NOT NULL,                          -- 표시명(가족 내 유니크 권장)
+  birthdate         DATE,
+  email             TEXT,
+  UNIQUE (household_id, display_name),
+  created_by        UUID,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by        UUID,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE usr.users IS '가족 구성원(부모/자녀). 역할은 코드테이블 참조';
+
+CREATE INDEX idx_users_household ON usr.users(household_id);
+
+CREATE TRIGGER users_uat
+BEFORE UPDATE ON usr.users
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+-- (선택) 부모-자녀 매핑 (권한/알림 라우팅 등 세분화 시)
+CREATE TABLE usr.parent_child (
+  parent_id   UUID NOT NULL REFERENCES usr.users(id) ON DELETE CASCADE,
+  child_id    UUID NOT NULL REFERENCES usr.users(id) ON DELETE CASCADE,
+  PRIMARY KEY (parent_id, child_id),
+  created_by  UUID,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by  UUID,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE usr.parent_child IS '부모-자녀 매핑';
+
+CREATE TRIGGER parent_child_uat
+BEFORE UPDATE ON usr.parent_child
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+-- =========================================================================
+-- 5) 미션 영역 (mis)
+-- =========================================================================
+
+CREATE TABLE mis.mission_templates (
+  id              UUID PRIMARY KEY DEFAULT core.UUID_V7(),         -- 템플릿 PK
+  household_id    UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  title           TEXT NOT NULL,                                    -- 템플릿 제목
+  description     TEXT,                                             -- 설명
+  default_points  INT  NOT NULL CHECK (default_points >= 0),        -- 기본 포인트
+  repeat_rule     TEXT,                                             -- RRULE 등 (예: FREQ=DAILY)
+  active          BOOLEAN NOT NULL DEFAULT TRUE,                    -- 사용여부
+  created_by      UUID,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by      UUID,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE mis.mission_templates IS '미션 템플릿(반복 규칙 포함)';
+
+CREATE INDEX idx_mtpl_household_active ON mis.mission_templates(household_id, active);
+
+CREATE TRIGGER mtpl_uat
+BEFORE UPDATE ON mis.mission_templates
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE mis.missions (
+  id               UUID PRIMARY KEY DEFAULT core.UUID_V7(),         -- 미션 인스턴스 PK
+  household_id     UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  template_id      UUID REFERENCES mis.mission_templates(id),       -- 템플릿 출처(선택)
+  child_id         UUID NOT NULL REFERENCES usr.users(id) ON DELETE CASCADE,
+  title            TEXT NOT NULL,                                   -- 제목(스냅샷/자유입력)
+  description      TEXT,                                            -- 설명
+  points           INT  NOT NULL CHECK (points >= 0),               -- 적립 포인트
+  due_at           TIMESTAMPTZ,                                     -- 마감일시
+  status_master_code TEXT GENERATED ALWAYS AS ('mission_status') STORED,
+  status_code        TEXT NOT NULL,                                 -- assigned/submitted/...
+  CONSTRAINT fk_missions_status
+    FOREIGN KEY (status_master_code, status_code)
+    REFERENCES core.code_details(master_code, code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  submitted_at     TIMESTAMPTZ,                                     -- 자녀 제출 시각
+  approved_at      TIMESTAMPTZ,                                     -- 승인 시각
+  approved_by      UUID REFERENCES usr.users(id),                    -- 승인자(부모)
+  cancelled_at     TIMESTAMPTZ,                                     -- 취소 시각
+  created_by       UUID,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by       UUID,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT approved_needs_timestamp CHECK (
+    status_code <> 'approved' OR approved_at IS NOT NULL
+  )
+);
+COMMENT ON TABLE mis.missions IS '자녀에게 할당된 실제 미션(상태/마감 포함)';
+
+CREATE INDEX idx_missions_child_status_due ON mis.missions(child_id, status_code, due_at);
+CREATE INDEX idx_missions_household_created ON mis.missions(household_id, created_at DESC);
+
+CREATE TRIGGER missions_uat
+BEFORE UPDATE ON mis.missions
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE mis.mission_proofs (
+  id               UUID PRIMARY KEY DEFAULT core.UUID_V7(),         -- 증빙 PK
+  mission_id       UUID NOT NULL REFERENCES mis.missions(id) ON DELETE CASCADE,
+  kind_master_code TEXT GENERATED ALWAYS AS ('proof_kind') STORED,
+  kind_code        TEXT NOT NULL,                                   -- photo/note ...
+  CONSTRAINT fk_mproofs_kind
+    FOREIGN KEY (kind_master_code, kind_code)
+    REFERENCES core.code_details(master_code, code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  url              TEXT,                                            -- 파일 저장소 URL/키
+  note             TEXT,                                            -- 메모
+  created_by       UUID,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by       UUID,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE mis.mission_proofs IS '미션 증빙 자료(사진/메모 등, 다건 가능)';
+
+CREATE INDEX idx_mproofs_mission ON mis.mission_proofs(mission_id, created_at);
+
+CREATE TRIGGER mproofs_uat
+BEFORE UPDATE ON mis.mission_proofs
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+-- =========================================================================
+-- 6) 포인트/보상 영역 (pt)
+-- =========================================================================
+
+CREATE TABLE pt.rewards (
+  id            UUID PRIMARY KEY DEFAULT core.UUID_V7(),            -- 보상 PK
+  household_id  UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL,                                      -- 상품명
+  description   TEXT,                                               -- 설명
+  points_cost   INT  NOT NULL CHECK (points_cost > 0),              -- 필요 포인트
+  stock         INT  CHECK (stock IS NULL OR stock >= 0),           -- NULL=무제한
+  active        BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by    UUID,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by    UUID,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE pt.rewards IS '교환 가능한 보상(상품). 비용/재고/활성 포함';
+
+CREATE INDEX idx_rewards_household_active ON pt.rewards(household_id, active);
+
+CREATE TRIGGER rewards_uat
+BEFORE UPDATE ON pt.rewards
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE pt.points_ledger (
+  id            UUID PRIMARY KEY DEFAULT core.UUID_V7(),            -- 원장 PK
+  household_id  UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  child_id      UUID NOT NULL REFERENCES usr.users(id) ON DELETE CASCADE,
+  source_master_code TEXT GENERATED ALWAYS AS ('ledger_source') STORED,
+  source_code   TEXT NOT NULL,                                      -- mission/manual/...
+  CONSTRAINT fk_ledger_source
+    FOREIGN KEY (source_master_code, source_code)
+    REFERENCES core.code_details(master_code, code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_id     UUID,                                               -- mis.missions.id / pt.redemptions.id 등
+  amount        INT  NOT NULL CHECK (amount <> 0),                  -- 적립:+ / 차감:-
+  description   TEXT,
+  created_by    UUID,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by    UUID,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE pt.points_ledger IS '포인트 원장(유일 진실). 합계=잔액';
+
+CREATE INDEX idx_ledger_child_time ON pt.points_ledger(child_id, created_at);
+CREATE INDEX idx_ledger_source ON pt.points_ledger(source_code, source_id);
+
+CREATE TRIGGER ledger_uat
+BEFORE UPDATE ON pt.points_ledger
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+CREATE TABLE pt.redemptions (
+  id                   UUID PRIMARY KEY DEFAULT core.UUID_V7(),     -- 교환 PK
+  household_id         UUID NOT NULL REFERENCES usr.households(id) ON DELETE CASCADE,
+  child_id             UUID NOT NULL REFERENCES usr.users(id) ON DELETE CASCADE,
+  reward_id            UUID NOT NULL REFERENCES pt.rewards(id),
+  status_master_code   TEXT GENERATED ALWAYS AS ('redemption_status') STORED,
+  status_code          TEXT NOT NULL,                               -- requested/approved/...
+  CONSTRAINT fk_redemptions_status
+    FOREIGN KEY (status_master_code, status_code)
+    REFERENCES core.code_details(master_code, code)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  points_cost_snapshot INT  NOT NULL CHECK (points_cost_snapshot > 0), -- 당시 비용 스냅샷
+  approved_by          UUID REFERENCES usr.users(id),                   -- 승인자(부모)
+  approved_at          TIMESTAMPTZ,
+  fulfilled_at         TIMESTAMPTZ,
+  cancelled_at         TIMESTAMPTZ,
+  created_by           UUID,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by           UUID,
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE pt.redemptions IS '상품 교환 요청/승인/지급/취소 내역';
+
+CREATE INDEX idx_redemptions_child_time ON pt.redemptions(child_id, created_at DESC);
+
+CREATE TRIGGER redemptions_uat
+BEFORE UPDATE ON pt.redemptions
+FOR EACH ROW EXECUTE FUNCTION core.trg_set_updated_at();
+
+-- =========================================================================
+-- 7) 보상 교환 트랜잭션 함수 (즉시 승인/차감 버전)
+--    - 잔액 확인 → 재고 확인/차감 → 교환 레코드 생성(승인) → 원장 차감
+--    - 동시성: 재고 UPDATE, 원장 입력을 같은 트랜잭션에서 처리
+-- =========================================================================
+CREATE OR REPLACE FUNCTION pt.redeem_reward_immediate(p_child UUID, p_reward UUID, p_parent UUID)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_household   UUID;
+  v_cost        INT;
+  v_stock       INT;
+  v_balance     INT;
+  v_redemption  UUID;
+BEGIN
+  -- 보상 정보 잠금 (재고 보호)
+  SELECT household_id, points_cost, COALESCE(stock, -1)
+    INTO v_household, v_cost, v_stock
+  FROM pt.rewards
+  WHERE id = p_reward AND active = TRUE
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Reward not found or inactive';
+  END IF;
+
+  -- 잔액 계산 (동시 차감 방지용 공유락 정도)
+  SELECT COALESCE(SUM(amount), 0)
+    INTO v_balance
+  FROM pt.points_ledger
+  WHERE child_id = p_child
+  FOR SHARE;
+
+  IF v_balance < v_cost THEN
+    RAISE EXCEPTION 'Insufficient points: balance %, cost %', v_balance, v_cost;
+  END IF;
+
+  -- 재고 차감 (무제한=-1)
+  IF v_stock >= 0 THEN
+    IF v_stock = 0 THEN
+      RAISE EXCEPTION 'Out of stock';
+    END IF;
+
+    UPDATE pt.rewards
+       SET stock = stock - 1
+     WHERE id = p_reward;
+  END IF;
+
+  -- 교환 레코드: 즉시 승인/지급 처리(승인자/시각)
+  INSERT INTO pt.redemptions (
+      id, household_id, child_id, reward_id,
+      status_master_code, status_code,
+      points_cost_snapshot, approved_by, approved_at, fulfilled_at,
+      created_by, created_at, updated_by, updated_at
+  )
+  VALUES (
+      core.UUID_V7(), v_household, p_child, p_reward,
+      'redemption_status', 'approved',
+      v_cost, p_parent, now(), now(),
+      p_parent, now(), p_parent, now()
+  )
+  RETURNING id INTO v_redemption;
+
+  -- 원장 차감
+  INSERT INTO pt.points_ledger (
+      id, household_id, child_id,
+      source_master_code, source_code, source_id,
+      amount, description, created_by, created_at, updated_by, updated_at
+  )
+  VALUES (
+      core.UUID_V7(), v_household, p_child,
+      'ledger_source', 'redemption', v_redemption,
+      -v_cost, '상품 교환 차감', p_parent, now(), p_parent, now()
+  );
+
+  RETURN v_redemption;
+END;
+$$;
+COMMENT ON FUNCTION pt.redeem_reward_immediate(UUID, UUID, UUID)
+IS '보상 즉시 교환(승인/차감) 트랜잭션 함수';
+
+-- =========================================================================
+-- 8) 리포트/뷰 (util)
+-- =========================================================================
+
+CREATE OR REPLACE VIEW util.v_child_points_balance AS
+SELECT
+  u.id            AS child_id,
+  u.display_name,
+  u.household_id,
+  COALESCE(SUM(l.amount), 0) AS balance
+FROM usr.users u
+LEFT JOIN pt.points_ledger l ON l.child_id = u.id
+WHERE (u.role_master_code, u.role_code) = ('user_role','child')
+GROUP BY u.id, u.display_name, u.household_id;
+COMMENT ON VIEW util.v_child_points_balance IS '자녀별 포인트 잔액(원장 합계 기반)';
+
+-- =========================================================================
+-- 9) 권한/서치패스 (예시) - 환경에 맞게 조정
+-- =========================================================================
+-- CREATE ROLE app_rw NOINHERIT LOGIN PASSWORD '***';
+-- CREATE ROLE app_ro NOLOGIN;
+-- GRANT USAGE ON SCHEMA core, usr, mis, pt, util TO app_rw, app_ro;
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA usr, mis, pt TO app_rw;
+-- GRANT SELECT ON ALL TABLES IN SCHEMA core, usr, mis, pt, util TO app_ro;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA usr GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA usr GRANT SELECT ON TABLES TO app_ro;
+-- -- (mis/pt/util/core에도 동일 설정 적용)
+-- ALTER ROLE app_rw IN DATABASE your_db SET search_path = usr, mis, pt, core, util, public;
+
+COMMIT;
+
+/* =======================================================================
+   사용 팁
+   - 코드 컬럼 입력 시 디테일 코드만 지정하면 됩니다.
+     예: mis.missions.status_code='submitted' → (status_master_code는 생성칼럼)
+   - 원장(points_ledger) 합계가 잔액이므로 별도 잔액 컬럼 불필요.
+   - 대량 삽입/갱신 시 트랜잭션 배치 크기 조절로 체크포인트 압력 완화.
+   - 동시성 강화가 필요하면 redeem 함수 내에서 자녀별 advisory lock 사용 검토.
+   ======================================================================= */
